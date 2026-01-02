@@ -5755,6 +5755,7 @@ where
         let reply_data = match &request.data {
             TypeLookupCall::GetTypes(get_types_in) => {
                 let mut found_types = Vec::new();
+                let mut included_hashes = std::collections::HashSet::new();
 
                 for type_id_bytes in &get_types_in.type_ids {
                     // Extract the hash from the TypeIdentifier
@@ -5766,7 +5767,8 @@ where
                                 dynamic_type.get_name(),
                                 hash
                             );
-                            // Convert DynamicType to TypeObject and serialize
+
+                            // First add the main type
                             let type_object_bytes = match dynamic_type.to_type_object() {
                                 Ok(type_object) => type_object.serialize_to_bytes(),
                                 Err(e) => {
@@ -5787,6 +5789,15 @@ where
                                 type_identifier: type_id_bytes.clone(),
                                 type_object: type_object_bytes,
                             });
+                            included_hashes.insert(hash);
+
+                            // Also include dependent types (enum members, nested structs, etc.)
+                            // This ensures the receiver can resolve hash references
+                            Self::collect_dependent_types(
+                                dynamic_type,
+                                &mut found_types,
+                                &mut included_hashes,
+                            );
                         } else {
                             tracing::debug!("Type not found for hash {:?}", hash);
                         }
@@ -5794,7 +5805,7 @@ where
                 }
 
                 tracing::debug!(
-                    "TypeLookup returning {} types for {} requested",
+                    "TypeLookup returning {} types for {} requested (including dependencies)",
                     found_types.len(),
                     get_types_in.type_ids.len()
                 );
@@ -5944,6 +5955,77 @@ where
                 "Received TypeLookup reply for unknown request: {:?}",
                 request_key
             );
+        }
+    }
+
+    /// Collects dependent types from a DynamicType and adds them to the TypeLookup response.
+    ///
+    /// When a struct has member types that are enums or nested structs, those types need
+    /// to be included in the TypeLookup response so the receiver can resolve hash references.
+    #[cfg(feature = "type_lookup")]
+    fn collect_dependent_types(
+        dynamic_type: &crate::xtypes::dynamic_type::DynamicType,
+        found_types: &mut Vec<crate::dcps::data_representation_builtin_endpoints::type_lookup::TypeIdentifierTypeObjectPairBytes>,
+        included_hashes: &mut std::collections::HashSet<[u8; 14]>,
+    ) {
+        use crate::xtypes::dynamic_type::TypeKind;
+        use crate::dcps::data_representation_builtin_endpoints::type_lookup::TypeIdentifierTypeObjectPairBytes;
+
+        // Only collect from struct types
+        if dynamic_type.get_kind() != TypeKind::STRUCTURE {
+            return;
+        }
+
+        // Iterate through struct members
+        for i in 0..dynamic_type.get_member_count() {
+            if let Ok(member) = dynamic_type.get_member_by_index(i) {
+                if let Ok(descriptor) = member.get_descriptor() {
+                    let member_type = &descriptor.r#type;
+                    let member_kind = member_type.get_kind();
+
+                    // Collect enum types and nested struct types
+                    if matches!(member_kind, TypeKind::ENUM | TypeKind::STRUCTURE) {
+                        // Compute the hash for this dependent type
+                        if let Ok(type_object) = member_type.to_type_object() {
+                            let serialized = type_object.serialize_to_bytes();
+                            let hash_full = md5::compute(&serialized);
+                            let mut hash = [0u8; 14];
+                            hash.copy_from_slice(&hash_full[0..14]);
+
+                            // Only add if not already included
+                            if !included_hashes.contains(&hash) {
+                                included_hashes.insert(hash);
+
+                                // Create the TypeIdentifier bytes (EK_COMPLETE + hash)
+                                let mut type_id_bytes = Vec::with_capacity(15);
+                                type_id_bytes.push(0xF2); // EK_COMPLETE
+                                type_id_bytes.extend_from_slice(&hash);
+
+                                found_types.push(TypeIdentifierTypeObjectPairBytes {
+                                    type_identifier: type_id_bytes,
+                                    type_object: serialized,
+                                });
+
+                                tracing::debug!(
+                                    "Added dependent type '{}' ({:?}) with hash {:?}",
+                                    member_type.get_name(),
+                                    member_kind,
+                                    hash
+                                );
+
+                                // Recursively collect from nested structs
+                                if member_kind == TypeKind::STRUCTURE {
+                                    Self::collect_dependent_types(
+                                        member_type,
+                                        found_types,
+                                        included_hashes,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

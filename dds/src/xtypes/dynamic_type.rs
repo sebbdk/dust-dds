@@ -3,14 +3,24 @@ use crate::xtypes::{
     data_storage::{DataStorage, DataStorageMapping},
     error::XTypesResult,
     type_object::{
-        CommonStructMember, CompleteMemberDetail, CompleteStructHeader, CompleteStructMember,
-        CompleteStructType, CompleteTypeDetail, CompleteTypeObject, PlainCollectionHeader,
-        PlainSequenceLElemDefn, StringLTypeDefn, StructMemberFlag, StructTypeFlag, TypeIdentifier,
-        TypeObject, CollectionElementFlag, EK_COMPLETE, INVALID_LBOUND,
-        TypeInformation, TypeIdentifierWithDependencies, TypeIdentifierWithSize,
+        CommonEnumeratedHeader, CommonEnumeratedLiteral, CommonStructMember,
+        CompleteEnumeratedHeader, CompleteEnumeratedLiteral, CompleteEnumeratedType,
+        CompleteMemberDetail, CompleteStructHeader, CompleteStructMember, CompleteStructType,
+        CompleteTypeDetail, CompleteTypeObject, CollectionElementFlag, EnumTypeFlag,
+        EnumeratedLiteralFlag, EquivalenceHash, PlainCollectionHeader, PlainSequenceLElemDefn,
+        StringLTypeDefn, StructMemberFlag, StructTypeFlag, TypeIdentifier, TypeObject,
+        EK_COMPLETE, INVALID_LBOUND,
     },
 };
 use alloc::{boxed::Box, collections::BTreeMap, string::String, vec, vec::Vec};
+
+/// Type registry for resolving hash-based type references during TypeLookup.
+///
+/// When TypeObjects are received over the wire, nested types (enums, structs)
+/// are typically referenced by their 14-byte equivalence hash rather than inlined.
+/// This registry maps hashes to their resolved DynamicTypes, enabling conversion
+/// of types with hash-based member references.
+pub type TypeRegistry = BTreeMap<EquivalenceHash, DynamicType>;
 
 pub type BoundSeq = Vec<u32>;
 pub type IncludePathSeq = Vec<String>;
@@ -95,9 +105,42 @@ impl DynamicTypeBuilderFactory {
     /// from remote participants and need to be converted to DynamicType for use
     /// with DynamicDataReader.
     pub fn create_type_w_type_object(type_object: TypeObject) -> XTypesResult<DynamicType> {
+        Self::create_type_w_type_object_with_registry(type_object, &TypeRegistry::new())
+    }
+
+    /// Creates a DynamicType from a TypeObject, using a registry to resolve hash references.
+    ///
+    /// When TypeObjects come over the wire, nested types (enums, structs) are typically
+    /// referenced by their 14-byte equivalence hash. This function uses the provided
+    /// registry to look up those hashes and resolve them to full DynamicTypes.
+    ///
+    /// # Arguments
+    /// * `type_object` - The TypeObject to convert
+    /// * `registry` - A map of equivalence hashes to already-converted DynamicTypes
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Build registry from all types received from TypeLookup
+    /// let mut registry = TypeRegistry::new();
+    /// for type_pair in types_out.types {
+    ///     let hash = compute_hash(&type_pair.type_identifier);
+    ///     let (type_obj, _) = TypeObject::deserialize_from_bytes(&type_pair.type_object)?;
+    ///     let dynamic_type = DynamicTypeBuilderFactory::create_type_w_type_object(type_obj)?;
+    ///     registry.insert(hash, dynamic_type);
+    /// }
+    /// // Now convert the main type with hash resolution
+    /// let main_type = DynamicTypeBuilderFactory::create_type_w_type_object_with_registry(
+    ///     main_type_object,
+    ///     &registry
+    /// )?;
+    /// ```
+    pub fn create_type_w_type_object_with_registry(
+        type_object: TypeObject,
+        registry: &TypeRegistry,
+    ) -> XTypesResult<DynamicType> {
         match type_object {
             TypeObject::EkComplete { complete } => {
-                Self::complete_type_object_to_dynamic_type(complete)
+                Self::complete_type_object_to_dynamic_type_with_registry(complete, registry)
             }
             TypeObject::EkMinimal { .. } => {
                 // MinimalTypeObject doesn't contain member names, only name hashes,
@@ -107,21 +150,21 @@ impl DynamicTypeBuilderFactory {
         }
     }
 
-    /// Converts a CompleteTypeObject to a DynamicType.
-    fn complete_type_object_to_dynamic_type(
+    /// Converts a CompleteTypeObject to a DynamicType with registry for hash resolution.
+    fn complete_type_object_to_dynamic_type_with_registry(
         complete: CompleteTypeObject,
+        registry: &TypeRegistry,
     ) -> XTypesResult<DynamicType> {
         match complete {
             CompleteTypeObject::TkStructure { struct_type } => {
-                Self::complete_struct_to_dynamic_type(struct_type)
+                Self::complete_struct_to_dynamic_type_with_registry(struct_type, registry)
             }
             CompleteTypeObject::TkAlias { .. } => {
                 // TODO: Implement alias type conversion
                 Err(XTypesError::IllegalOperation)
             }
-            CompleteTypeObject::TkEnum { .. } => {
-                // TODO: Implement enum type conversion
-                Err(XTypesError::IllegalOperation)
+            CompleteTypeObject::TkEnum { enumerated_type } => {
+                Self::complete_enum_to_dynamic_type(enumerated_type)
             }
             CompleteTypeObject::TkUnion { .. } => {
                 // TODO: Implement union type conversion
@@ -154,8 +197,11 @@ impl DynamicTypeBuilderFactory {
         }
     }
 
-    /// Converts a CompleteStructType to a DynamicType.
-    fn complete_struct_to_dynamic_type(struct_type: CompleteStructType) -> XTypesResult<DynamicType> {
+    /// Converts a CompleteStructType to a DynamicType with registry for hash resolution.
+    fn complete_struct_to_dynamic_type_with_registry(
+        struct_type: CompleteStructType,
+        registry: &TypeRegistry,
+    ) -> XTypesResult<DynamicType> {
         // Determine extensibility from struct flags
         let extensibility_kind = if struct_type.struct_flags.is_final {
             ExtensibilityKind::Final
@@ -181,7 +227,8 @@ impl DynamicTypeBuilderFactory {
 
         // Add members
         for (index, member) in struct_type.member_seq.into_iter().enumerate() {
-            let member_type = Self::type_identifier_to_dynamic_type(&member.common.member_type_id)?;
+            let member_type =
+                Self::type_identifier_to_dynamic_type_with_registry(&member.common.member_type_id, registry)?;
 
             // Extract flags from member_flags
             let try_construct_kind = member.common.member_flags.try_construct;
@@ -208,8 +255,67 @@ impl DynamicTypeBuilderFactory {
         Ok(builder.build())
     }
 
+    /// Converts a CompleteEnumeratedType to a DynamicType.
+    fn complete_enum_to_dynamic_type(
+        enumerated_type: CompleteEnumeratedType,
+    ) -> XTypesResult<DynamicType> {
+        // Determine discriminator type from bit_bound
+        let bit_bound = enumerated_type.header.common.bit_bound;
+        let discriminator_type = if bit_bound <= 8 {
+            Self::get_primitive_type(TypeKind::INT8)
+        } else if bit_bound <= 16 {
+            Self::get_primitive_type(TypeKind::INT16)
+        } else {
+            Self::get_primitive_type(TypeKind::INT32)
+        };
+
+        let mut builder = Self::create_type(TypeDescriptor {
+            kind: TypeKind::ENUM,
+            name: enumerated_type.header.detail.type_name,
+            base_type: None,
+            discriminator_type: Some(discriminator_type),
+            bound: Vec::new(),
+            element_type: None,
+            key_element_type: None,
+            extensibility_kind: ExtensibilityKind::Final, // Enums are typically final
+            is_nested: false,
+        });
+
+        // Add enum literals as members
+        for literal in enumerated_type.literal_seq {
+            builder.add_member(MemberDescriptor {
+                name: literal.detail.name,
+                id: literal.common.value as u32,
+                r#type: Self::get_primitive_type(TypeKind::INT32), // Enum value type
+                default_value: Some(DataStorage::Int32(literal.common.value)),
+                index: literal.common.value as u32,
+                label: Vec::new(),
+                try_construct_kind: TryConstructKind::UseDefault,
+                is_key: false,
+                is_optional: false,
+                is_must_understand: false,
+                is_shared: false,
+                is_default_label: literal.common.flags.is_default,
+            })?;
+        }
+
+        Ok(builder.build())
+    }
+
     /// Converts a TypeIdentifier to a DynamicType.
     pub fn type_identifier_to_dynamic_type(type_id: &TypeIdentifier) -> XTypesResult<DynamicType> {
+        Self::type_identifier_to_dynamic_type_with_registry(type_id, &TypeRegistry::new())
+    }
+
+    /// Converts a TypeIdentifier to a DynamicType, using a registry for hash resolution.
+    ///
+    /// When TypeObjects come over the wire, nested types (enums, structs) are referenced
+    /// by their 14-byte equivalence hash. This function looks up those hashes in the
+    /// provided registry to resolve them to full DynamicTypes.
+    pub fn type_identifier_to_dynamic_type_with_registry(
+        type_id: &TypeIdentifier,
+        registry: &TypeRegistry,
+    ) -> XTypesResult<DynamicType> {
         match type_id {
             // Primitive types
             TypeIdentifier::TkNone => Ok(Self::get_primitive_type(TypeKind::NONE)),
@@ -244,7 +350,7 @@ impl DynamicTypeBuilderFactory {
             // Sequence types
             TypeIdentifier::TiPlainSequenceSmall { seq_sdefn } => {
                 let element_type =
-                    Self::type_identifier_to_dynamic_type(&seq_sdefn.element_identifier)?;
+                    Self::type_identifier_to_dynamic_type_with_registry(&seq_sdefn.element_identifier, registry)?;
                 let bound = if seq_sdefn.bound == 0 {
                     INVALID_LBOUND // Unbounded
                 } else {
@@ -254,14 +360,14 @@ impl DynamicTypeBuilderFactory {
             }
             TypeIdentifier::TiPlainSequenceLarge { seq_ldefn } => {
                 let element_type =
-                    Self::type_identifier_to_dynamic_type(&seq_ldefn.element_identifier)?;
+                    Self::type_identifier_to_dynamic_type_with_registry(&seq_ldefn.element_identifier, registry)?;
                 Ok(Self::create_sequence_type(element_type, seq_ldefn.bound).build())
             }
 
             // Array types
             TypeIdentifier::TiPlainArraySmall { array_sdefn } => {
                 let element_type =
-                    Self::type_identifier_to_dynamic_type(&array_sdefn.element_identifier)?;
+                    Self::type_identifier_to_dynamic_type_with_registry(&array_sdefn.element_identifier, registry)?;
                 let bounds: Vec<u32> = array_sdefn
                     .array_bound_seq
                     .iter()
@@ -271,7 +377,7 @@ impl DynamicTypeBuilderFactory {
             }
             TypeIdentifier::TiPlainArrayLarge { array_ldefn } => {
                 let element_type =
-                    Self::type_identifier_to_dynamic_type(&array_ldefn.element_identifier)?;
+                    Self::type_identifier_to_dynamic_type_with_registry(&array_ldefn.element_identifier, registry)?;
                 Ok(Self::create_array_type(element_type, array_ldefn.array_bound_seq.clone()).build())
             }
 
@@ -291,10 +397,13 @@ impl DynamicTypeBuilderFactory {
             // Minimal type reference - cannot fully convert without name info
             TypeIdentifier::EkMinimal { .. } => Err(XTypesError::IllegalOperation),
 
-            // Hash-only variants - cannot convert without looking up the full type
-            TypeIdentifier::EkCompleteHash { .. } | TypeIdentifier::EkMinimalHash { .. } => {
-                Err(XTypesError::IllegalOperation)
+            // Hash-based type reference - look up in registry
+            TypeIdentifier::EkCompleteHash { hash } => {
+                registry.get(hash).cloned().ok_or(XTypesError::IllegalOperation)
             }
+
+            // Minimal hash - cannot fully convert without name info
+            TypeIdentifier::EkMinimalHash { .. } => Err(XTypesError::IllegalOperation),
         }
     }
 
@@ -583,6 +692,9 @@ impl DynamicType {
             TypeKind::STRUCTURE => Ok(TypeObject::EkComplete {
                 complete: self.to_complete_struct_type()?,
             }),
+            TypeKind::ENUM => Ok(TypeObject::EkComplete {
+                complete: self.to_complete_enum_type()?,
+            }),
             // Other type kinds can be added as needed
             _ => Err(XTypesError::IllegalOperation),
         }
@@ -637,6 +749,55 @@ impl DynamicType {
                 struct_flags,
                 header,
                 member_seq,
+            },
+        })
+    }
+
+    /// Converts this DynamicType to a CompleteEnumeratedType.
+    fn to_complete_enum_type(&self) -> XTypesResult<CompleteTypeObject> {
+        // Determine bit_bound from discriminator type
+        let bit_bound = match self
+            .descriptor
+            .discriminator_type
+            .as_ref()
+            .map(|t| t.get_kind())
+        {
+            Some(TypeKind::INT8) => 8,
+            Some(TypeKind::INT16) => 16,
+            _ => 32, // Default to 32-bit
+        };
+
+        let header = CompleteEnumeratedHeader {
+            common: CommonEnumeratedHeader { bit_bound },
+            detail: CompleteTypeDetail {
+                ann_builtin: None,
+                ann_custom: None,
+                type_name: self.descriptor.name.clone(),
+            },
+        };
+
+        let mut literal_seq = Vec::new();
+        for member in &self.member_list {
+            literal_seq.push(CompleteEnumeratedLiteral {
+                common: CommonEnumeratedLiteral {
+                    value: member.descriptor.id as i32,
+                    flags: EnumeratedLiteralFlag {
+                        is_default: member.descriptor.is_default_label,
+                    },
+                },
+                detail: CompleteMemberDetail {
+                    name: member.descriptor.name.clone(),
+                    ann_builtin: None,
+                    ann_custom: None,
+                },
+            });
+        }
+
+        Ok(CompleteTypeObject::TkEnum {
+            enumerated_type: CompleteEnumeratedType {
+                enum_flags: EnumTypeFlag,
+                header,
+                literal_seq,
             },
         })
     }
@@ -697,6 +858,11 @@ impl DynamicType {
 
             // Nested structure - embed as EkComplete with the full DynamicType
             TypeKind::STRUCTURE => Ok(TypeIdentifier::EkComplete {
+                complete: Box::new(dynamic_type.clone()),
+            }),
+
+            // Enum type - embed as EkComplete with the full DynamicType
+            TypeKind::ENUM => Ok(TypeIdentifier::EkComplete {
                 complete: Box::new(dynamic_type.clone()),
             }),
 
@@ -1646,5 +1812,775 @@ mod tests {
             result.is_err(),
             "Should return error for MinimalTypeObject"
         );
+    }
+
+    /// Test converting an enum TypeObject to DynamicType.
+    ///
+    /// This simulates receiving an enum type via TypeLookup:
+    /// ```idl
+    /// enum Color {
+    ///     RED,    // 0
+    ///     GREEN,  // 1
+    ///     BLUE    // 2
+    /// };
+    /// ```
+    #[test]
+    fn test_complete_enum_to_dynamic_type() {
+        use crate::xtypes::type_object::{
+            CommonEnumeratedHeader, CommonEnumeratedLiteral, CompleteEnumeratedHeader,
+            CompleteEnumeratedLiteral, CompleteEnumeratedType, EnumTypeFlag, EnumeratedLiteralFlag,
+        };
+
+        let enumerated_type = CompleteEnumeratedType {
+            enum_flags: EnumTypeFlag,
+            header: CompleteEnumeratedHeader {
+                common: CommonEnumeratedHeader { bit_bound: 32 },
+                detail: CompleteTypeDetail {
+                    ann_builtin: None,
+                    ann_custom: None,
+                    type_name: String::from("test::Color"),
+                },
+            },
+            literal_seq: vec![
+                CompleteEnumeratedLiteral {
+                    common: CommonEnumeratedLiteral {
+                        value: 0,
+                        flags: EnumeratedLiteralFlag { is_default: true },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("RED"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+                CompleteEnumeratedLiteral {
+                    common: CommonEnumeratedLiteral {
+                        value: 1,
+                        flags: EnumeratedLiteralFlag { is_default: false },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("GREEN"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+                CompleteEnumeratedLiteral {
+                    common: CommonEnumeratedLiteral {
+                        value: 2,
+                        flags: EnumeratedLiteralFlag { is_default: false },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("BLUE"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+            ],
+        };
+
+        let type_object = TypeObject::EkComplete {
+            complete: CompleteTypeObject::TkEnum { enumerated_type },
+        };
+
+        // Convert TypeObject to DynamicType
+        let result = DynamicTypeBuilderFactory::create_type_w_type_object(type_object);
+        assert!(result.is_ok(), "Failed to convert enum TypeObject: {:?}", result);
+
+        let dynamic_type = result.unwrap();
+
+        // Verify type properties
+        assert_eq!(dynamic_type.get_name(), "test::Color");
+        assert_eq!(dynamic_type.get_kind(), TypeKind::ENUM);
+        assert_eq!(dynamic_type.get_member_count(), 3);
+
+        // Verify discriminator type is INT32 (bit_bound 32)
+        let discriminator = dynamic_type.get_descriptor().discriminator_type.as_ref();
+        assert!(discriminator.is_some());
+        assert_eq!(discriminator.unwrap().get_kind(), TypeKind::INT32);
+
+        // Verify enum literals
+        let member0 = dynamic_type.get_member_by_index(0).unwrap();
+        assert_eq!(member0.get_name(), "RED");
+        assert_eq!(member0.get_id(), 0);
+        assert!(member0.get_descriptor().unwrap().is_default_label);
+
+        let member1 = dynamic_type.get_member_by_index(1).unwrap();
+        assert_eq!(member1.get_name(), "GREEN");
+        assert_eq!(member1.get_id(), 1);
+
+        let member2 = dynamic_type.get_member_by_index(2).unwrap();
+        assert_eq!(member2.get_name(), "BLUE");
+        assert_eq!(member2.get_id(), 2);
+    }
+
+    /// Test enum DynamicType → CompleteTypeObject → DynamicType roundtrip.
+    #[test]
+    fn test_enum_dynamic_type_roundtrip() {
+        // Create an enum DynamicType
+        let discriminator_type =
+            DynamicTypeBuilderFactory::get_primitive_type(TypeKind::INT32);
+        let mut builder = DynamicTypeBuilderFactory::create_type(TypeDescriptor {
+            kind: TypeKind::ENUM,
+            name: String::from("test::Status"),
+            base_type: None,
+            discriminator_type: Some(discriminator_type),
+            bound: Vec::new(),
+            element_type: None,
+            key_element_type: None,
+            extensibility_kind: ExtensibilityKind::Final,
+            is_nested: false,
+        });
+
+        builder
+            .add_member(MemberDescriptor {
+                name: String::from("OK"),
+                id: 0,
+                r#type: DynamicTypeBuilderFactory::get_primitive_type(TypeKind::INT32),
+                default_value: Some(DataStorage::Int32(0)),
+                index: 0,
+                label: Vec::new(),
+                try_construct_kind: TryConstructKind::UseDefault,
+                is_key: false,
+                is_optional: false,
+                is_must_understand: false,
+                is_shared: false,
+                is_default_label: true,
+            })
+            .unwrap();
+
+        builder
+            .add_member(MemberDescriptor {
+                name: String::from("ERROR"),
+                id: 1,
+                r#type: DynamicTypeBuilderFactory::get_primitive_type(TypeKind::INT32),
+                default_value: Some(DataStorage::Int32(1)),
+                index: 1,
+                label: Vec::new(),
+                try_construct_kind: TryConstructKind::UseDefault,
+                is_key: false,
+                is_optional: false,
+                is_must_understand: false,
+                is_shared: false,
+                is_default_label: false,
+            })
+            .unwrap();
+
+        let original_type = builder.build();
+
+        // Convert to TypeObject
+        let type_object = original_type.to_type_object();
+        assert!(type_object.is_ok(), "Failed to convert DynamicType to TypeObject");
+
+        // Convert back to DynamicType
+        let roundtrip_result =
+            DynamicTypeBuilderFactory::create_type_w_type_object(type_object.unwrap());
+        assert!(
+            roundtrip_result.is_ok(),
+            "Failed roundtrip: {:?}",
+            roundtrip_result
+        );
+
+        let roundtrip_type = roundtrip_result.unwrap();
+
+        // Verify roundtrip preserved type properties
+        assert_eq!(roundtrip_type.get_name(), original_type.get_name());
+        assert_eq!(roundtrip_type.get_kind(), original_type.get_kind());
+        assert_eq!(
+            roundtrip_type.get_member_count(),
+            original_type.get_member_count()
+        );
+
+        // Verify members
+        for i in 0..original_type.get_member_count() {
+            let orig_member = original_type.get_member_by_index(i).unwrap();
+            let rt_member = roundtrip_type.get_member_by_index(i).unwrap();
+            assert_eq!(rt_member.get_name(), orig_member.get_name());
+            assert_eq!(rt_member.get_id(), orig_member.get_id());
+        }
+    }
+
+    /// Test enum with small bit_bound (INT8 discriminator).
+    #[test]
+    fn test_enum_with_int8_discriminator() {
+        use crate::xtypes::type_object::{
+            CommonEnumeratedHeader, CommonEnumeratedLiteral, CompleteEnumeratedHeader,
+            CompleteEnumeratedLiteral, CompleteEnumeratedType, EnumTypeFlag, EnumeratedLiteralFlag,
+        };
+
+        let enumerated_type = CompleteEnumeratedType {
+            enum_flags: EnumTypeFlag,
+            header: CompleteEnumeratedHeader {
+                common: CommonEnumeratedHeader { bit_bound: 8 }, // Small enum
+                detail: CompleteTypeDetail {
+                    ann_builtin: None,
+                    ann_custom: None,
+                    type_name: String::from("test::SmallEnum"),
+                },
+            },
+            literal_seq: vec![CompleteEnumeratedLiteral {
+                common: CommonEnumeratedLiteral {
+                    value: 0,
+                    flags: EnumeratedLiteralFlag { is_default: true },
+                },
+                detail: CompleteMemberDetail {
+                    name: String::from("ONLY"),
+                    ann_builtin: None,
+                    ann_custom: None,
+                },
+            }],
+        };
+
+        let type_object = TypeObject::EkComplete {
+            complete: CompleteTypeObject::TkEnum { enumerated_type },
+        };
+
+        let result = DynamicTypeBuilderFactory::create_type_w_type_object(type_object);
+        assert!(result.is_ok());
+
+        let dynamic_type = result.unwrap();
+        let discriminator = dynamic_type.get_descriptor().discriminator_type.as_ref();
+        assert!(discriminator.is_some());
+        assert_eq!(discriminator.unwrap().get_kind(), TypeKind::INT8);
+    }
+
+    /// Test enum TypeObject wire serialization roundtrip.
+    ///
+    /// This tests that CompleteEnumeratedType can be serialized to bytes
+    /// and deserialized back, which is critical for TypeLookup over the wire.
+    #[test]
+    fn test_enum_type_object_serialization_roundtrip() {
+        use crate::xtypes::type_object::{
+            CommonEnumeratedHeader, CommonEnumeratedLiteral, CompleteEnumeratedHeader,
+            CompleteEnumeratedLiteral, CompleteEnumeratedType, EnumTypeFlag, EnumeratedLiteralFlag,
+        };
+
+        // Create an enum type
+        let original_enum = CompleteEnumeratedType {
+            enum_flags: EnumTypeFlag,
+            header: CompleteEnumeratedHeader {
+                common: CommonEnumeratedHeader { bit_bound: 32 },
+                detail: CompleteTypeDetail {
+                    ann_builtin: None,
+                    ann_custom: None,
+                    type_name: String::from("test::Direction"),
+                },
+            },
+            literal_seq: vec![
+                CompleteEnumeratedLiteral {
+                    common: CommonEnumeratedLiteral {
+                        value: 0,
+                        flags: EnumeratedLiteralFlag { is_default: true },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("NORTH"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+                CompleteEnumeratedLiteral {
+                    common: CommonEnumeratedLiteral {
+                        value: 1,
+                        flags: EnumeratedLiteralFlag { is_default: false },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("SOUTH"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+                CompleteEnumeratedLiteral {
+                    common: CommonEnumeratedLiteral {
+                        value: 2,
+                        flags: EnumeratedLiteralFlag { is_default: false },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("EAST"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+                CompleteEnumeratedLiteral {
+                    common: CommonEnumeratedLiteral {
+                        value: 3,
+                        flags: EnumeratedLiteralFlag { is_default: false },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("WEST"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+            ],
+        };
+
+        let original_type_object = TypeObject::EkComplete {
+            complete: CompleteTypeObject::TkEnum {
+                enumerated_type: original_enum,
+            },
+        };
+
+        // Serialize to bytes
+        let bytes = original_type_object.serialize_to_bytes();
+        assert!(!bytes.is_empty(), "Serialized bytes should not be empty");
+
+        // Deserialize from bytes
+        let deserialized = TypeObject::deserialize_from_bytes(&bytes);
+        assert!(
+            deserialized.is_some(),
+            "Failed to deserialize TypeObject from bytes"
+        );
+
+        let (deserialized_type_object, _bytes_read) = deserialized.unwrap();
+
+        // Convert both to DynamicType and compare
+        let original_dynamic =
+            DynamicTypeBuilderFactory::create_type_w_type_object(original_type_object);
+        let deserialized_dynamic =
+            DynamicTypeBuilderFactory::create_type_w_type_object(deserialized_type_object);
+
+        assert!(original_dynamic.is_ok());
+        assert!(deserialized_dynamic.is_ok());
+
+        let orig = original_dynamic.unwrap();
+        let deser = deserialized_dynamic.unwrap();
+
+        // Verify the deserialized type matches the original
+        assert_eq!(deser.get_name(), orig.get_name());
+        assert_eq!(deser.get_kind(), orig.get_kind());
+        assert_eq!(deser.get_member_count(), orig.get_member_count());
+
+        // Verify all enum literals
+        for i in 0..orig.get_member_count() {
+            let orig_member = orig.get_member_by_index(i).unwrap();
+            let deser_member = deser.get_member_by_index(i).unwrap();
+            assert_eq!(deser_member.get_name(), orig_member.get_name());
+            assert_eq!(deser_member.get_id(), orig_member.get_id());
+        }
+    }
+
+    /// Test struct with enum member referenced by hash - simulates wire format.
+    ///
+    /// This tests the kasse Log type scenario:
+    /// ```idl
+    /// enum LogLevel { DEBUG, INFO, WARN, ERROR };
+    /// struct Log {
+    ///     LogLevel level;      // <-- enum member referenced by hash on wire
+    ///     string source;
+    ///     long long timestamp_ms;
+    ///     string message;
+    /// };
+    /// ```
+    ///
+    /// When TypeObjects come over the wire, nested types (enums, nested structs)
+    /// are referenced by their 14-byte equivalence hash, not inlined.
+    /// The TypeLookup service resolves these hashes using a type registry.
+    #[test]
+    fn test_struct_with_enum_member_by_hash() {
+        use crate::xtypes::type_object::{
+            CommonEnumeratedHeader, CommonEnumeratedLiteral, CompleteEnumeratedHeader,
+            CompleteEnumeratedLiteral, CompleteEnumeratedType, EnumTypeFlag, EnumeratedLiteralFlag,
+        };
+
+        // Create a hash that would reference LogLevel enum
+        // (In real wire format, this would be MD5(serialized enum TypeObject)[0..14])
+        let enum_hash: [u8; 14] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                                   0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e];
+
+        // Step 1: Create the LogLevel enum type (as if received from TypeLookup)
+        let log_level_enum = CompleteEnumeratedType {
+            enum_flags: EnumTypeFlag,
+            header: CompleteEnumeratedHeader {
+                common: CommonEnumeratedHeader { bit_bound: 32 },
+                detail: CompleteTypeDetail {
+                    ann_builtin: None,
+                    ann_custom: None,
+                    type_name: String::from("network::LogLevel"),
+                },
+            },
+            literal_seq: vec![
+                CompleteEnumeratedLiteral {
+                    common: CommonEnumeratedLiteral {
+                        value: 0,
+                        flags: EnumeratedLiteralFlag { is_default: true },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("DEBUG"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+                CompleteEnumeratedLiteral {
+                    common: CommonEnumeratedLiteral {
+                        value: 1,
+                        flags: EnumeratedLiteralFlag { is_default: false },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("INFO"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+                CompleteEnumeratedLiteral {
+                    common: CommonEnumeratedLiteral {
+                        value: 2,
+                        flags: EnumeratedLiteralFlag { is_default: false },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("WARN"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+                CompleteEnumeratedLiteral {
+                    common: CommonEnumeratedLiteral {
+                        value: 3,
+                        flags: EnumeratedLiteralFlag { is_default: false },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("ERROR"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+            ],
+        };
+
+        // Convert enum to DynamicType and add to registry
+        let enum_type_object = TypeObject::EkComplete {
+            complete: CompleteTypeObject::TkEnum { enumerated_type: log_level_enum },
+        };
+        let enum_dynamic_type = DynamicTypeBuilderFactory::create_type_w_type_object(enum_type_object)
+            .expect("Failed to create LogLevel enum DynamicType");
+
+        // Step 2: Build registry mapping hash -> DynamicType
+        let mut registry = TypeRegistry::new();
+        registry.insert(enum_hash, enum_dynamic_type);
+
+        // Step 3: Create the Log struct where the enum member is referenced by hash
+        let struct_type = CompleteStructType {
+            struct_flags: StructTypeFlag {
+                is_final: true,
+                is_appendable: false,
+                is_mutable: false,
+                is_nested: false,
+                is_autoid_hash: false,
+            },
+            header: CompleteStructHeader {
+                base_type: TypeIdentifier::TkNone,
+                detail: CompleteTypeDetail {
+                    ann_builtin: None,
+                    ann_custom: None,
+                    type_name: String::from("network::Log"),
+                },
+            },
+            member_seq: vec![
+                // level: LogLevel - referenced by hash (this is what comes over wire)
+                CompleteStructMember {
+                    common: CommonStructMember {
+                        member_id: 0,
+                        member_flags: StructMemberFlag {
+                            try_construct: TryConstructKind::UseDefault,
+                            is_external: false,
+                            is_optional: false,
+                            is_must_undestand: false,
+                            is_key: false,
+                        },
+                        member_type_id: TypeIdentifier::EkCompleteHash { hash: enum_hash },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("level"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+                // source: string
+                CompleteStructMember {
+                    common: CommonStructMember {
+                        member_id: 1,
+                        member_flags: StructMemberFlag {
+                            try_construct: TryConstructKind::UseDefault,
+                            is_external: false,
+                            is_optional: false,
+                            is_must_undestand: false,
+                            is_key: false,
+                        },
+                        member_type_id: TypeIdentifier::TiString8Large {
+                            string_ldefn: crate::xtypes::type_object::StringLTypeDefn { bound: 0 },
+                        },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("source"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+                // timestamp_ms: long long
+                CompleteStructMember {
+                    common: CommonStructMember {
+                        member_id: 2,
+                        member_flags: StructMemberFlag {
+                            try_construct: TryConstructKind::UseDefault,
+                            is_external: false,
+                            is_optional: false,
+                            is_must_undestand: false,
+                            is_key: false,
+                        },
+                        member_type_id: TypeIdentifier::TkInt64Type,
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("timestamp_ms"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+                // message: string
+                CompleteStructMember {
+                    common: CommonStructMember {
+                        member_id: 3,
+                        member_flags: StructMemberFlag {
+                            try_construct: TryConstructKind::UseDefault,
+                            is_external: false,
+                            is_optional: false,
+                            is_must_undestand: false,
+                            is_key: false,
+                        },
+                        member_type_id: TypeIdentifier::TiString8Large {
+                            string_ldefn: crate::xtypes::type_object::StringLTypeDefn { bound: 0 },
+                        },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("message"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+            ],
+        };
+
+        let type_object = TypeObject::EkComplete {
+            complete: CompleteTypeObject::TkStructure { struct_type },
+        };
+
+        // Step 4: Convert struct with registry - this resolves the enum hash
+        let result = DynamicTypeBuilderFactory::create_type_w_type_object_with_registry(
+            type_object,
+            &registry,
+        );
+
+        assert!(result.is_ok(), "Failed to convert struct with enum member by hash: {:?}", result);
+
+        let log_type = result.unwrap();
+
+        // Verify the struct was converted correctly
+        assert_eq!(log_type.get_name(), "network::Log");
+        assert_eq!(log_type.get_kind(), TypeKind::STRUCTURE);
+        assert_eq!(log_type.get_member_count(), 4);
+
+        // Verify the enum member was resolved (level is at index 0, first member)
+        let level_member = log_type.get_member_by_index(0).expect("level member not found");
+        let level_type = &level_member.get_descriptor().unwrap().r#type;
+        assert_eq!(level_type.get_kind(), TypeKind::ENUM);
+        assert_eq!(level_type.get_name(), "network::LogLevel");
+        assert_eq!(level_type.get_member_count(), 4); // DEBUG, INFO, WARN, ERROR
+    }
+
+    /// Test struct with enum member inlined (not by hash) - should work today.
+    ///
+    /// This is the workaround case: if the enum is inlined in the struct's
+    /// TypeObject rather than referenced by hash, conversion should succeed.
+    #[test]
+    fn test_struct_with_enum_member_inlined() {
+        use crate::xtypes::type_object::{
+            CommonEnumeratedHeader, CommonEnumeratedLiteral, CompleteEnumeratedHeader,
+            CompleteEnumeratedLiteral, CompleteEnumeratedType, EnumTypeFlag, EnumeratedLiteralFlag,
+        };
+
+        // First create the LogLevel enum as a DynamicType
+        let log_level_enum = CompleteEnumeratedType {
+            enum_flags: EnumTypeFlag,
+            header: CompleteEnumeratedHeader {
+                common: CommonEnumeratedHeader { bit_bound: 32 },
+                detail: CompleteTypeDetail {
+                    ann_builtin: None,
+                    ann_custom: None,
+                    type_name: String::from("network::LogLevel"),
+                },
+            },
+            literal_seq: vec![
+                CompleteEnumeratedLiteral {
+                    common: CommonEnumeratedLiteral {
+                        value: 0,
+                        flags: EnumeratedLiteralFlag { is_default: true },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("DEBUG"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+                CompleteEnumeratedLiteral {
+                    common: CommonEnumeratedLiteral {
+                        value: 1,
+                        flags: EnumeratedLiteralFlag { is_default: false },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("INFO"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+                CompleteEnumeratedLiteral {
+                    common: CommonEnumeratedLiteral {
+                        value: 2,
+                        flags: EnumeratedLiteralFlag { is_default: false },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("WARN"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+                CompleteEnumeratedLiteral {
+                    common: CommonEnumeratedLiteral {
+                        value: 3,
+                        flags: EnumeratedLiteralFlag { is_default: false },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("ERROR"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+            ],
+        };
+
+        // Convert enum to DynamicType for inlining
+        let enum_type_object = TypeObject::EkComplete {
+            complete: CompleteTypeObject::TkEnum { enumerated_type: log_level_enum },
+        };
+        let enum_dynamic_type = DynamicTypeBuilderFactory::create_type_w_type_object(enum_type_object)
+            .expect("Failed to create LogLevel enum DynamicType");
+
+        // Create Log struct with enum INLINED via EkComplete (not hash)
+        let struct_type = CompleteStructType {
+            struct_flags: StructTypeFlag {
+                is_final: true,
+                is_appendable: false,
+                is_mutable: false,
+                is_nested: false,
+                is_autoid_hash: false,
+            },
+            header: CompleteStructHeader {
+                base_type: TypeIdentifier::TkNone,
+                detail: CompleteTypeDetail {
+                    ann_builtin: None,
+                    ann_custom: None,
+                    type_name: String::from("network::Log"),
+                },
+            },
+            member_seq: vec![
+                // level: LogLevel - INLINED via EkComplete
+                CompleteStructMember {
+                    common: CommonStructMember {
+                        member_id: 0,
+                        member_flags: StructMemberFlag {
+                            try_construct: TryConstructKind::UseDefault,
+                            is_external: false,
+                            is_optional: false,
+                            is_must_undestand: false,
+                            is_key: false,
+                        },
+                        member_type_id: TypeIdentifier::EkComplete {
+                            complete: Box::new(enum_dynamic_type.clone()),
+                        },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("level"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+                // source: string
+                CompleteStructMember {
+                    common: CommonStructMember {
+                        member_id: 1,
+                        member_flags: StructMemberFlag {
+                            try_construct: TryConstructKind::UseDefault,
+                            is_external: false,
+                            is_optional: false,
+                            is_must_undestand: false,
+                            is_key: false,
+                        },
+                        member_type_id: TypeIdentifier::TiString8Large {
+                            string_ldefn: crate::xtypes::type_object::StringLTypeDefn { bound: 0 },
+                        },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("source"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+                // timestamp_ms: long long
+                CompleteStructMember {
+                    common: CommonStructMember {
+                        member_id: 2,
+                        member_flags: StructMemberFlag {
+                            try_construct: TryConstructKind::UseDefault,
+                            is_external: false,
+                            is_optional: false,
+                            is_must_undestand: false,
+                            is_key: false,
+                        },
+                        member_type_id: TypeIdentifier::TkInt64Type,
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("timestamp_ms"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+                // message: string
+                CompleteStructMember {
+                    common: CommonStructMember {
+                        member_id: 3,
+                        member_flags: StructMemberFlag {
+                            try_construct: TryConstructKind::UseDefault,
+                            is_external: false,
+                            is_optional: false,
+                            is_must_undestand: false,
+                            is_key: false,
+                        },
+                        member_type_id: TypeIdentifier::TiString8Large {
+                            string_ldefn: crate::xtypes::type_object::StringLTypeDefn { bound: 0 },
+                        },
+                    },
+                    detail: CompleteMemberDetail {
+                        name: String::from("message"),
+                        ann_builtin: None,
+                        ann_custom: None,
+                    },
+                },
+            ],
+        };
+
+        let type_object = TypeObject::EkComplete {
+            complete: CompleteTypeObject::TkStructure { struct_type },
+        };
+
+        // This SHOULD work because enum is inlined, not referenced by hash
+        let result = DynamicTypeBuilderFactory::create_type_w_type_object(type_object);
+        assert!(result.is_ok(), "Struct with inlined enum should convert: {:?}", result);
+
+        let log_type = result.unwrap();
+        assert_eq!(log_type.get_name(), "network::Log");
+        assert_eq!(log_type.get_member_count(), 4);
+
+        // Verify the enum member
+        let level_member = log_type.get_member_by_index(0).unwrap();
+        assert_eq!(level_member.get_name(), "level");
+        let level_desc = level_member.get_descriptor().unwrap();
+        assert_eq!(level_desc.r#type.get_kind(), TypeKind::ENUM);
+        assert_eq!(level_desc.r#type.get_name(), "network::LogLevel");
     }
 }

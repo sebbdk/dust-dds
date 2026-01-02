@@ -701,32 +701,88 @@ impl DomainParticipantAsync {
                     )));
                 }
 
-                let type_pair = &types_out.types[0];
-                if type_pair.type_object.is_empty() {
-                    return Err(DdsError::PreconditionNotMet(alloc::format!(
-                        "TypeLookup returned empty TypeObject for topic '{}'. \
-                         The remote participant may not support TypeObject serialization.",
-                        topic_name
-                    )));
+                use crate::xtypes::type_object::{TypeIdentifier, TypeObject};
+                use crate::xtypes::dynamic_type::{DynamicTypeBuilderFactory, TypeRegistry};
+
+                // Build a registry from all types in the response.
+                // This allows dependent types (like enums referenced by hash) to be resolved.
+                let mut registry = TypeRegistry::new();
+
+                // First pass: deserialize all types and add non-struct types to the registry.
+                // Non-struct types (enums, etc.) don't have dependencies, so they can be
+                // converted directly. Struct types may reference these by hash.
+                let mut main_type_object = None;
+
+                for (i, type_pair) in types_out.types.iter().enumerate() {
+                    if type_pair.type_object.is_empty() {
+                        if i == 0 {
+                            return Err(DdsError::PreconditionNotMet(alloc::format!(
+                                "TypeLookup returned empty TypeObject for topic '{}'. \
+                                 The remote participant may not support TypeObject serialization.",
+                                topic_name
+                            )));
+                        }
+                        continue;
+                    }
+
+                    // Deserialize the TypeIdentifier to extract the hash
+                    let type_id = if !type_pair.type_identifier.is_empty() {
+                        TypeIdentifier::deserialize_from(&type_pair.type_identifier)
+                            .map(|(id, _)| id)
+                    } else {
+                        None
+                    };
+
+                    // Deserialize the TypeObject
+                    let (type_object, _) =
+                        TypeObject::deserialize_from_bytes(&type_pair.type_object).ok_or_else(
+                            || {
+                                DdsError::PreconditionNotMet(alloc::format!(
+                                    "Failed to deserialize TypeObject {} ({} bytes) for topic '{}'",
+                                    i,
+                                    type_pair.type_object.len(),
+                                    topic_name
+                                ))
+                            },
+                        )?;
+
+                    if i == 0 {
+                        // Save the main type for later conversion
+                        main_type_object = Some(type_object);
+                    } else {
+                        // Dependency types - add to registry if we have a hash
+                        if let Some(type_id) = type_id {
+                            let hash = match &type_id {
+                                TypeIdentifier::EkCompleteHash { hash } => Some(*hash),
+                                TypeIdentifier::EkMinimalHash { hash } => Some(*hash),
+                                _ => None,
+                            };
+
+                            if let Some(hash) = hash {
+                                // Convert to DynamicType using the registry we're building
+                                if let Ok(dynamic_type) =
+                                    DynamicTypeBuilderFactory::create_type_w_type_object_with_registry(
+                                        type_object,
+                                        &registry,
+                                    )
+                                {
+                                    registry.insert(hash, dynamic_type);
+                                }
+                            }
+                        }
+                    }
                 }
 
-                // Deserialize TypeObject from XCDR2 bytes
-                use crate::xtypes::type_object::TypeObject;
-                use crate::xtypes::dynamic_type::DynamicTypeBuilderFactory;
+                // Convert the main type using the populated registry
+                let main_type_object = main_type_object.ok_or_else(|| {
+                    DdsError::PreconditionNotMet("No main type object found".to_string())
+                })?;
 
-                let (type_object, _bytes_read) =
-                    TypeObject::deserialize_from_bytes(&type_pair.type_object).ok_or_else(
-                        || {
-                            DdsError::PreconditionNotMet(alloc::format!(
-                                "Failed to deserialize TypeObject ({} bytes) for topic '{}'",
-                                type_pair.type_object.len(),
-                                topic_name
-                            ))
-                        },
-                    )?;
-
-                // Convert TypeObject to DynamicType
-                DynamicTypeBuilderFactory::create_type_w_type_object(type_object).map_err(|e| {
+                DynamicTypeBuilderFactory::create_type_w_type_object_with_registry(
+                    main_type_object,
+                    &registry,
+                )
+                .map_err(|e| {
                     DdsError::PreconditionNotMet(alloc::format!(
                         "Failed to convert TypeObject to DynamicType for topic '{}': {:?}",
                         topic_name,

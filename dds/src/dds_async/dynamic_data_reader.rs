@@ -454,4 +454,485 @@ mod tests {
             .await
             .expect("Failed to delete participant");
     }
+
+    /// An enum type for integration testing.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    #[repr(i32)]
+    enum Priority {
+        Low = 0,
+        Medium = 1,
+        High = 2,
+    }
+
+    /// A struct with an enum field for integration testing.
+    #[derive(Debug, Clone, PartialEq)]
+    struct TaskWithPriority {
+        task_id: i32,
+        priority: Priority,
+        description: String,
+    }
+
+    impl TypeSupport for TaskWithPriority {
+        fn get_type_name() -> &'static str {
+            "TaskWithPriority"
+        }
+
+        fn get_type() -> DynamicType {
+            // Create the Priority enum type
+            let discriminator_type =
+                DynamicTypeBuilderFactory::get_primitive_type(TypeKind::INT32);
+            let mut enum_builder = DynamicTypeBuilderFactory::create_type(TypeDescriptor {
+                kind: TypeKind::ENUM,
+                name: String::from("Priority"),
+                base_type: None,
+                discriminator_type: Some(discriminator_type),
+                bound: Vec::new(),
+                element_type: None,
+                key_element_type: None,
+                extensibility_kind: ExtensibilityKind::Final,
+                is_nested: false,
+            });
+            enum_builder
+                .add_member(MemberDescriptor {
+                    name: String::from("Low"),
+                    id: 0,
+                    r#type: DynamicTypeBuilderFactory::get_primitive_type(TypeKind::INT32),
+                    default_value: None,
+                    index: 0,
+                    label: Vec::new(),
+                    try_construct_kind: TryConstructKind::UseDefault,
+                    is_key: false,
+                    is_optional: false,
+                    is_must_understand: false,
+                    is_shared: false,
+                    is_default_label: true,
+                })
+                .unwrap();
+            enum_builder
+                .add_member(MemberDescriptor {
+                    name: String::from("Medium"),
+                    id: 1,
+                    r#type: DynamicTypeBuilderFactory::get_primitive_type(TypeKind::INT32),
+                    default_value: None,
+                    index: 1,
+                    label: Vec::new(),
+                    try_construct_kind: TryConstructKind::UseDefault,
+                    is_key: false,
+                    is_optional: false,
+                    is_must_understand: false,
+                    is_shared: false,
+                    is_default_label: false,
+                })
+                .unwrap();
+            enum_builder
+                .add_member(MemberDescriptor {
+                    name: String::from("High"),
+                    id: 2,
+                    r#type: DynamicTypeBuilderFactory::get_primitive_type(TypeKind::INT32),
+                    default_value: None,
+                    index: 2,
+                    label: Vec::new(),
+                    try_construct_kind: TryConstructKind::UseDefault,
+                    is_key: false,
+                    is_optional: false,
+                    is_must_understand: false,
+                    is_shared: false,
+                    is_default_label: false,
+                })
+                .unwrap();
+            let priority_enum = enum_builder.build();
+
+            // Create the struct type
+            let mut builder = DynamicTypeBuilderFactory::create_type(TypeDescriptor {
+                kind: TypeKind::STRUCTURE,
+                name: String::from("TaskWithPriority"),
+                base_type: None,
+                discriminator_type: None,
+                bound: Vec::new(),
+                element_type: None,
+                key_element_type: None,
+                extensibility_kind: ExtensibilityKind::Final,
+                is_nested: false,
+            });
+            builder
+                .add_member(MemberDescriptor {
+                    name: String::from("task_id"),
+                    id: 0,
+                    r#type: <i32 as XTypesBinding>::get_dynamic_type(),
+                    default_value: None,
+                    index: 0,
+                    label: Vec::new(),
+                    try_construct_kind: TryConstructKind::UseDefault,
+                    is_key: true,
+                    is_optional: false,
+                    is_must_understand: false,
+                    is_shared: false,
+                    is_default_label: false,
+                })
+                .unwrap();
+            builder
+                .add_member(MemberDescriptor {
+                    name: String::from("priority"),
+                    id: 1,
+                    r#type: priority_enum,
+                    default_value: None,
+                    index: 1,
+                    label: Vec::new(),
+                    try_construct_kind: TryConstructKind::UseDefault,
+                    is_key: false,
+                    is_optional: false,
+                    is_must_understand: false,
+                    is_shared: false,
+                    is_default_label: false,
+                })
+                .unwrap();
+            builder
+                .add_member(MemberDescriptor {
+                    name: String::from("description"),
+                    id: 2,
+                    r#type: DynamicTypeBuilderFactory::create_string_type(0).build(),
+                    default_value: None,
+                    index: 2,
+                    label: Vec::new(),
+                    try_construct_kind: TryConstructKind::UseDefault,
+                    is_key: false,
+                    is_optional: false,
+                    is_must_understand: false,
+                    is_shared: false,
+                    is_default_label: false,
+                })
+                .unwrap();
+            builder.build()
+        }
+
+        fn create_sample(src: DynamicData) -> Self {
+            let task_id = src
+                .get_value(0)
+                .ok()
+                .and_then(|s| i32::try_from_storage(s.clone()).ok())
+                .unwrap_or(0);
+            let priority_value = src
+                .get_complex_value(1)
+                .ok()
+                .and_then(|p| p.get_int32_value(0).ok().map(|v| *v))
+                .unwrap_or(0);
+            let priority = match priority_value {
+                0 => Priority::Low,
+                1 => Priority::Medium,
+                2 => Priority::High,
+                _ => Priority::Low,
+            };
+            let description = src
+                .get_value(2)
+                .ok()
+                .and_then(|s| String::try_from_storage(s.clone()).ok())
+                .unwrap_or_default();
+            TaskWithPriority {
+                task_id,
+                priority,
+                description,
+            }
+        }
+
+        fn create_dynamic_sample(self) -> DynamicData {
+            let mut data =
+                crate::xtypes::dynamic_type::DynamicDataFactory::create_data(Self::get_type());
+            data.set_value(0, self.task_id.into_storage());
+
+            // Create priority enum value
+            let priority_type = Self::get_type()
+                .get_member_by_index(1)
+                .unwrap()
+                .get_descriptor()
+                .unwrap()
+                .r#type
+                .clone();
+            let mut priority_data =
+                crate::xtypes::dynamic_type::DynamicDataFactory::create_data(priority_type);
+            priority_data.set_int32_value(0, self.priority as i32).unwrap();
+            data.set_complex_value(1, priority_data).unwrap();
+
+            data.set_value(2, self.description.into_storage());
+            data
+        }
+    }
+
+    /// Integration test: Typed DataWriter with enum field writes, DynamicDataReader reads.
+    ///
+    /// This test verifies AC #3 from TASK-19: "Integration test: Typed DataWriter with
+    /// enum field → DynamicDataReader via TypeLookup"
+    #[tokio::test]
+    async fn test_dynamic_data_reader_reads_struct_with_enum_field() {
+        // Create participant with unique domain
+        let factory = DomainParticipantFactoryAsync::get_instance();
+        let participant = factory
+            .create_participant(201, QosKind::Default, None::<()>, NO_STATUS)
+            .await
+            .expect("Failed to create participant");
+
+        // Create topic with typed DataWriter's type
+        let topic = participant
+            .create_topic::<TaskWithPriority>(
+                "TaskTopic",
+                "TaskWithPriority",
+                QosKind::Default,
+                None::<()>,
+                NO_STATUS,
+            )
+            .await
+            .expect("Failed to create topic");
+
+        // Create publisher and typed DataWriter
+        let publisher = participant
+            .create_publisher(QosKind::Default, None::<()>, NO_STATUS)
+            .await
+            .expect("Failed to create publisher");
+
+        let mut writer_qos = crate::infrastructure::qos::DataWriterQos::default();
+        writer_qos.reliability = ReliabilityQosPolicy {
+            kind: ReliabilityQosPolicyKind::Reliable,
+            max_blocking_time: DurationKind::Finite(Duration::new(1, 0)),
+        };
+        let writer = publisher
+            .create_datawriter::<TaskWithPriority>(
+                &topic,
+                QosKind::Specific(writer_qos),
+                None::<()>,
+                NO_STATUS,
+            )
+            .await
+            .expect("Failed to create datawriter");
+
+        // Create subscriber and DynamicDataReader
+        let subscriber = participant
+            .create_subscriber(QosKind::Default, None::<()>, NO_STATUS)
+            .await
+            .expect("Failed to create subscriber");
+
+        let dynamic_type = TaskWithPriority::get_type();
+        let mut reader_qos = crate::infrastructure::qos::DataReaderQos::default();
+        reader_qos.reliability = ReliabilityQosPolicy {
+            kind: ReliabilityQosPolicyKind::Reliable,
+            max_blocking_time: DurationKind::Finite(Duration::new(1, 0)),
+        };
+        let dynamic_reader = subscriber
+            .create_dynamic_datareader("TaskTopic", dynamic_type, QosKind::Specific(reader_qos))
+            .await
+            .expect("Failed to create dynamic datareader");
+
+        // Wait for discovery
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Write data with typed DataWriter - task with High priority
+        let test_data = TaskWithPriority {
+            task_id: 100,
+            priority: Priority::High,
+            description: String::from("Important task with enum!"),
+        };
+        writer
+            .write(test_data, None)
+            .await
+            .expect("Failed to write");
+
+        // Wait for data to propagate
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Read with DynamicDataReader
+        let samples = dynamic_reader
+            .take(10, &ANY_SAMPLE_STATE, &ANY_VIEW_STATE, &ANY_INSTANCE_STATE)
+            .await
+            .expect("Failed to take samples");
+
+        assert!(!samples.is_empty(), "Expected at least one sample");
+
+        let sample = &samples[0];
+        assert!(sample.data.is_some(), "Expected valid data");
+
+        let data = sample.data.as_ref().unwrap();
+
+        // Verify task_id
+        let task_id = data
+            .get_int32_value_by_name("task_id")
+            .expect("Failed to get task_id");
+        assert_eq!(*task_id, 100);
+
+        // Verify priority enum - access as complex value, then get int32
+        let priority_data = data
+            .get_complex_value_by_name("priority")
+            .expect("Failed to get priority");
+        let priority_value = priority_data
+            .get_int32_value(0)
+            .expect("Failed to get priority value");
+        assert_eq!(*priority_value, 2, "Expected High priority (value 2)");
+
+        // Verify description
+        let description = data
+            .get_string_value_by_name("description")
+            .expect("Failed to get description");
+        assert_eq!(description.as_str(), "Important task with enum!");
+
+        // Cleanup
+        participant
+            .delete_contained_entities()
+            .await
+            .expect("Failed to delete entities");
+        factory
+            .delete_participant(&participant)
+            .await
+            .expect("Failed to delete participant");
+    }
+
+    /// Integration test: Tests the full TypeLookup flow with hash-based enum resolution.
+    ///
+    /// This test specifically validates:
+    /// 1. TypeLookup discovers a type with enum members
+    /// 2. The enum type (referenced by hash) is resolved correctly
+    /// 3. A DynamicDataReader can be created with the discovered type
+    /// 4. Data with enum values can be read correctly
+    ///
+    /// Unlike `test_dynamic_data_reader_reads_struct_with_enum_field` which uses
+    /// `get_type()` directly, this test calls `discover_type()` to exercise the
+    /// full TypeLookup protocol including hash resolution.
+    #[cfg(feature = "type_lookup")]
+    #[tokio::test]
+    async fn test_typelookup_discovers_struct_with_enum_via_hash() {
+        // Create participant with unique domain
+        let factory = DomainParticipantFactoryAsync::get_instance();
+        let participant = factory
+            .create_participant(202, QosKind::Default, None::<()>, NO_STATUS)
+            .await
+            .expect("Failed to create participant");
+
+        // Create topic with typed DataWriter's type
+        let topic = participant
+            .create_topic::<TaskWithPriority>(
+                "TypeLookupTaskTopic",
+                "TaskWithPriority",
+                QosKind::Default,
+                None::<()>,
+                NO_STATUS,
+            )
+            .await
+            .expect("Failed to create topic");
+
+        // Create publisher and typed DataWriter
+        let publisher = participant
+            .create_publisher(QosKind::Default, None::<()>, NO_STATUS)
+            .await
+            .expect("Failed to create publisher");
+
+        let mut writer_qos = crate::infrastructure::qos::DataWriterQos::default();
+        writer_qos.reliability = ReliabilityQosPolicy {
+            kind: ReliabilityQosPolicyKind::Reliable,
+            max_blocking_time: DurationKind::Finite(Duration::new(1, 0)),
+        };
+        writer_qos.durability = crate::infrastructure::qos_policy::DurabilityQosPolicy {
+            kind: crate::infrastructure::qos_policy::DurabilityQosPolicyKind::TransientLocal,
+        };
+        let writer = publisher
+            .create_datawriter::<TaskWithPriority>(
+                &topic,
+                QosKind::Specific(writer_qos),
+                None::<()>,
+                NO_STATUS,
+            )
+            .await
+            .expect("Failed to create datawriter");
+
+        // Write data before discovering type (to test durability)
+        let test_data = TaskWithPriority {
+            task_id: 42,
+            priority: Priority::High,
+            description: String::from("TypeLookup test with enum!"),
+        };
+        writer
+            .write(test_data, None)
+            .await
+            .expect("Failed to write");
+
+        // Give time for writer to be discovered
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Now use discover_type() to get the type via TypeLookup
+        // This exercises the full TypeLookup protocol including hash resolution
+        let discovered_type = participant
+            .discover_type("TypeLookupTaskTopic")
+            .await
+            .expect("Failed to discover type via TypeLookup");
+
+        // Verify the discovered type structure
+        assert_eq!(discovered_type.get_name(), "TaskWithPriority");
+        assert_eq!(discovered_type.get_kind(), crate::xtypes::dynamic_type::TypeKind::STRUCTURE);
+        assert_eq!(discovered_type.get_member_count(), 3, "Expected 3 members: task_id, priority, description");
+
+        // Create subscriber and DynamicDataReader with discovered type
+        let subscriber = participant
+            .create_subscriber(QosKind::Default, None::<()>, NO_STATUS)
+            .await
+            .expect("Failed to create subscriber");
+
+        let mut reader_qos = crate::infrastructure::qos::DataReaderQos::default();
+        reader_qos.reliability = ReliabilityQosPolicy {
+            kind: ReliabilityQosPolicyKind::Reliable,
+            max_blocking_time: DurationKind::Finite(Duration::new(1, 0)),
+        };
+        reader_qos.durability = crate::infrastructure::qos_policy::DurabilityQosPolicy {
+            kind: crate::infrastructure::qos_policy::DurabilityQosPolicyKind::TransientLocal,
+        };
+        let dynamic_reader = subscriber
+            .create_dynamic_datareader(
+                "TypeLookupTaskTopic",
+                discovered_type,
+                QosKind::Specific(reader_qos),
+            )
+            .await
+            .expect("Failed to create dynamic datareader with discovered type");
+
+        // Wait for subscription to match and data to arrive
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Read with DynamicDataReader
+        let samples = dynamic_reader
+            .take(10, &ANY_SAMPLE_STATE, &ANY_VIEW_STATE, &ANY_INSTANCE_STATE)
+            .await
+            .expect("Failed to take samples");
+
+        assert!(!samples.is_empty(), "Expected at least one sample from TypeLookup-discovered reader");
+
+        let sample = &samples[0];
+        assert!(sample.data.is_some(), "Expected valid data");
+
+        let data = sample.data.as_ref().unwrap();
+
+        // Verify task_id
+        let task_id = data
+            .get_int32_value_by_name("task_id")
+            .expect("Failed to get task_id");
+        assert_eq!(*task_id, 42);
+
+        // Verify priority enum - this validates enum hash resolution worked
+        let priority_data = data
+            .get_complex_value_by_name("priority")
+            .expect("Failed to get priority from TypeLookup-discovered type");
+        let priority_value = priority_data
+            .get_int32_value(0)
+            .expect("Failed to get priority value");
+        assert_eq!(*priority_value, 2, "Expected High priority (value 2)");
+
+        // Verify description
+        let description = data
+            .get_string_value_by_name("description")
+            .expect("Failed to get description");
+        assert_eq!(description.as_str(), "TypeLookup test with enum!");
+
+        // Cleanup
+        participant
+            .delete_contained_entities()
+            .await
+            .expect("Failed to delete entities");
+        factory
+            .delete_participant(&participant)
+            .await
+            .expect("Failed to delete participant");
+    }
 }
