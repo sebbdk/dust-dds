@@ -543,7 +543,8 @@ trait XTypesDeserialize {
             }
             TypeKind::STRING16 => todo!(),
             TypeKind::ALIAS => todo!(),
-            TypeKind::ENUM => todo!(),
+            TypeKind::ENUM => dynamic_data
+                .set_complex_values(member.get_id(), self.deserialize_complex_sequence(member)?),
             TypeKind::BITMASK => todo!(),
             TypeKind::ANNOTATION => todo!(),
             TypeKind::STRUCTURE => dynamic_data

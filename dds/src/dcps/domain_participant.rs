@@ -5976,6 +5976,10 @@ where
             return;
         }
 
+        // Collect types in depth-first order: dependencies BEFORE the types that use them.
+        // This ensures enums are in the response before structs that reference them,
+        // allowing the receiver to build the registry in order.
+
         // Iterate through struct members
         for i in 0..dynamic_type.get_member_count() {
             if let Ok(member) = dynamic_type.get_member_by_index(i) {
@@ -5983,10 +5987,35 @@ where
                     let member_type = &descriptor.r#type;
                     let member_kind = member_type.get_kind();
 
-                    // Collect enum types and nested struct types
-                    if matches!(member_kind, TypeKind::ENUM | TypeKind::STRUCTURE) {
-                        // Compute the hash for this dependent type
-                        if let Ok(type_object) = member_type.to_type_object() {
+                    // Determine the complex type to collect (if any)
+                    let complex_type_to_add: Option<&crate::xtypes::dynamic_type::DynamicType> = match member_kind {
+                        // Direct enum or struct members
+                        TypeKind::ENUM | TypeKind::STRUCTURE => Some(member_type),
+                        // Sequence members - check their element type
+                        TypeKind::SEQUENCE => {
+                            member_type.get_descriptor().element_type.as_ref().filter(|et| {
+                                matches!(et.get_kind(), TypeKind::ENUM | TypeKind::STRUCTURE)
+                            })
+                        }
+                        _ => None,
+                    };
+
+                    // Add the complex type if found
+                    if let Some(complex_type) = complex_type_to_add {
+                        let kind = complex_type.get_kind();
+
+                        // DEPTH-FIRST: Recursively collect dependencies of nested structs FIRST
+                        // This ensures enums inside the struct are added before the struct itself
+                        if kind == TypeKind::STRUCTURE {
+                            Self::collect_dependent_types(
+                                complex_type,
+                                found_types,
+                                included_hashes,
+                            );
+                        }
+
+                        // NOW add this type (after its dependencies have been added)
+                        if let Ok(type_object) = complex_type.to_type_object() {
                             let serialized = type_object.serialize_to_bytes();
                             let hash_full = md5::compute(&serialized);
                             let mut hash = [0u8; 14];
@@ -6008,19 +6037,10 @@ where
 
                                 tracing::debug!(
                                     "Added dependent type '{}' ({:?}) with hash {:?}",
-                                    member_type.get_name(),
-                                    member_kind,
+                                    complex_type.get_name(),
+                                    kind,
                                     hash
                                 );
-
-                                // Recursively collect from nested structs
-                                if member_kind == TypeKind::STRUCTURE {
-                                    Self::collect_dependent_types(
-                                        member_type,
-                                        found_types,
-                                        included_hashes,
-                                    );
-                                }
                             }
                         }
                     }
