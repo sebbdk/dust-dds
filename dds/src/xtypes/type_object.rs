@@ -1153,9 +1153,13 @@ impl CompleteTypeObject {
                 buffer.push(TypeKind::STRUCTURE as u8);
                 struct_type.serialize_to(buffer);
             }
+            CompleteTypeObject::TkEnum { enumerated_type } => {
+                // Discriminator for TkEnum (TypeKind::ENUM = 0x40)
+                buffer.push(TypeKind::ENUM as u8);
+                enumerated_type.serialize_to(buffer);
+            }
             // Other type kinds - serialize discriminator only for now
             CompleteTypeObject::TkAlias { .. } => buffer.push(TypeKind::ALIAS as u8),
-            CompleteTypeObject::TkEnum { .. } => buffer.push(TypeKind::ENUM as u8),
             CompleteTypeObject::TkUnion { .. } => buffer.push(TypeKind::UNION as u8),
             CompleteTypeObject::TkSequence { .. } => buffer.push(TypeKind::SEQUENCE as u8),
             CompleteTypeObject::TkArray { .. } => buffer.push(TypeKind::ARRAY as u8),
@@ -1180,6 +1184,11 @@ impl CompleteTypeObject {
                 let (struct_type, bytes_read) = CompleteStructType::deserialize_from(&data[cursor..])?;
                 cursor += bytes_read;
                 Some((CompleteTypeObject::TkStructure { struct_type }, cursor))
+            }
+            x if x == TypeKind::ENUM as u8 => {
+                let (enumerated_type, bytes_read) = CompleteEnumeratedType::deserialize_from(&data[cursor..])?;
+                cursor += bytes_read;
+                Some((CompleteTypeObject::TkEnum { enumerated_type }, cursor))
             }
             // Other type kinds not yet supported for deserialization
             _ => None,
@@ -1580,6 +1589,188 @@ impl CompleteMemberDetail {
             },
             cursor,
         ))
+    }
+}
+
+// ============== Enum serialization ==============
+
+impl CompleteEnumeratedType {
+    fn serialize_to(&self, buffer: &mut Vec<u8>) {
+        // enum_flags: EnumTypeFlag (empty, 0 bytes - unit struct)
+        // No bytes needed for unit struct
+
+        // header: CompleteEnumeratedHeader (APPENDABLE - needs DHEADER)
+        self.header.serialize_to(buffer);
+
+        // literal_seq: sequence of CompleteEnumeratedLiteral
+        buffer.extend_from_slice(&(self.literal_seq.len() as u32).to_le_bytes());
+        for literal in &self.literal_seq {
+            literal.serialize_to(buffer);
+        }
+    }
+
+    fn deserialize_from(data: &[u8]) -> Option<(Self, usize)> {
+        let mut cursor = 0;
+
+        // enum_flags: EnumTypeFlag (empty, 0 bytes)
+        let enum_flags = EnumTypeFlag;
+
+        // header: CompleteEnumeratedHeader (APPENDABLE - has DHEADER)
+        let (header, bytes_read) = CompleteEnumeratedHeader::deserialize_from(&data[cursor..])?;
+        cursor += bytes_read;
+
+        // literal_seq: sequence
+        if data.len() < cursor + 4 {
+            return None;
+        }
+        let literal_count = u32::from_le_bytes([
+            data[cursor],
+            data[cursor + 1],
+            data[cursor + 2],
+            data[cursor + 3],
+        ]) as usize;
+        cursor += 4;
+
+        let mut literal_seq = Vec::with_capacity(literal_count);
+        for _ in 0..literal_count {
+            let (literal, bytes_read) = CompleteEnumeratedLiteral::deserialize_from(&data[cursor..])?;
+            cursor += bytes_read;
+            literal_seq.push(literal);
+        }
+
+        Some((
+            CompleteEnumeratedType {
+                enum_flags,
+                header,
+                literal_seq,
+            },
+            cursor,
+        ))
+    }
+}
+
+impl CompleteEnumeratedHeader {
+    fn serialize_to(&self, buffer: &mut Vec<u8>) {
+        // APPENDABLE type needs DHEADER
+        let mut content = Vec::new();
+
+        // common: CommonEnumeratedHeader
+        self.common.serialize_to(&mut content);
+
+        // detail: CompleteTypeDetail
+        self.detail.serialize_to(&mut content);
+
+        // Write DHEADER + content
+        buffer.extend_from_slice(&(content.len() as u32).to_le_bytes());
+        buffer.extend_from_slice(&content);
+    }
+
+    fn deserialize_from(data: &[u8]) -> Option<(Self, usize)> {
+        let mut cursor = 0;
+
+        // Read DHEADER
+        if data.len() < 4 {
+            return None;
+        }
+        let _dheader = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        cursor += 4;
+
+        // common: CommonEnumeratedHeader
+        let (common, bytes_read) = CommonEnumeratedHeader::deserialize_from(&data[cursor..])?;
+        cursor += bytes_read;
+
+        // detail: CompleteTypeDetail
+        let (detail, bytes_read) = CompleteTypeDetail::deserialize_from(&data[cursor..])?;
+        cursor += bytes_read;
+
+        Some((CompleteEnumeratedHeader { common, detail }, cursor))
+    }
+}
+
+impl CommonEnumeratedHeader {
+    fn serialize_to(&self, buffer: &mut Vec<u8>) {
+        // bit_bound: u16
+        buffer.extend_from_slice(&self.bit_bound.to_le_bytes());
+    }
+
+    fn deserialize_from(data: &[u8]) -> Option<(Self, usize)> {
+        if data.len() < 2 {
+            return None;
+        }
+        let bit_bound = u16::from_le_bytes([data[0], data[1]]);
+        Some((CommonEnumeratedHeader { bit_bound }, 2))
+    }
+}
+
+impl CompleteEnumeratedLiteral {
+    fn serialize_to(&self, buffer: &mut Vec<u8>) {
+        // APPENDABLE type needs DHEADER
+        let mut content = Vec::new();
+
+        // common: CommonEnumeratedLiteral
+        self.common.serialize_to(&mut content);
+
+        // detail: CompleteMemberDetail
+        self.detail.serialize_to(&mut content);
+
+        // Write DHEADER + content
+        buffer.extend_from_slice(&(content.len() as u32).to_le_bytes());
+        buffer.extend_from_slice(&content);
+    }
+
+    fn deserialize_from(data: &[u8]) -> Option<(Self, usize)> {
+        let mut cursor = 0;
+
+        // Read DHEADER
+        if data.len() < 4 {
+            return None;
+        }
+        let _dheader = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        cursor += 4;
+
+        // common: CommonEnumeratedLiteral
+        let (common, bytes_read) = CommonEnumeratedLiteral::deserialize_from(&data[cursor..])?;
+        cursor += bytes_read;
+
+        // detail: CompleteMemberDetail
+        let (detail, bytes_read) = CompleteMemberDetail::deserialize_from(&data[cursor..])?;
+        cursor += bytes_read;
+
+        Some((CompleteEnumeratedLiteral { common, detail }, cursor))
+    }
+}
+
+impl CommonEnumeratedLiteral {
+    fn serialize_to(&self, buffer: &mut Vec<u8>) {
+        // value: i32
+        buffer.extend_from_slice(&self.value.to_le_bytes());
+
+        // flags: EnumeratedLiteralFlag (u16)
+        let flags = self.flags.to_u16();
+        buffer.extend_from_slice(&flags.to_le_bytes());
+    }
+
+    fn deserialize_from(data: &[u8]) -> Option<(Self, usize)> {
+        if data.len() < 6 {
+            return None;
+        }
+        let value = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let flags_u16 = u16::from_le_bytes([data[4], data[5]]);
+        let flags = EnumeratedLiteralFlag::from_u16(flags_u16);
+
+        Some((CommonEnumeratedLiteral { value, flags }, 6))
+    }
+}
+
+impl EnumeratedLiteralFlag {
+    fn to_u16(&self) -> u16 {
+        if self.is_default { 0x0040 } else { 0 }
+    }
+
+    fn from_u16(flags: u16) -> Self {
+        EnumeratedLiteralFlag {
+            is_default: (flags & 0x0040) != 0,
+        }
     }
 }
 
